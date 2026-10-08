@@ -19,6 +19,7 @@ import {
   type ADNodeData,
   type ADNodeKind,
   type EdgeKind,
+  type SubnetData,
   type UserData,
 } from "../types/entities";
 
@@ -41,6 +42,19 @@ function edgeStyleFor(kind: EdgeKind) {
   };
 }
 
+// /24 network for an IPv4 address, e.g. "10.10.10.5" -> "10.10.10.0/24".
+function networkOf(ip: string): string | null {
+  const m = ip.trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return null;
+  const octets = m.slice(1, 5).map(Number);
+  if (octets.some((o) => o > 255)) return null;
+  return `${octets[0]}.${octets[1]}.${octets[2]}.0/24`;
+}
+
+const SUBNET_COLS = 2;
+const SUBNET_COL_WIDTH = 220;
+const SUBNET_ROW_HEIGHT = 100;
+
 interface GraphState {
   nodes: ADNode[];
   edges: ADEdge[];
@@ -62,6 +76,7 @@ interface GraphState {
   selectEdge: (id: string | null) => void;
 
   syncUsersFromHost: (hostId: string) => { created: number; updated: number };
+  syncSubnetGrouping: () => void;
 
   addChatMessage: (message: Omit<ChatMessage, "id" | "timestamp">) => void;
   clearChat: () => void;
@@ -124,6 +139,149 @@ export const useGraphStore = create<GraphState>()(
             n.id === id ? { ...n, data: { ...n.data, ...data } as ADNodeData } : n
           ),
         });
+        if ("ips" in data) get().syncSubnetGrouping();
+      },
+
+      syncSubnetGrouping: () => {
+        let working = [...get().nodes];
+        let changed = false;
+
+        const findSubnetByCidr = (cidr: string) =>
+          working.find((n) => n.type === "subnet" && (n.data as SubnetData).cidr === cidr);
+
+        const parentCidrOf = (node: ADNode) => {
+          if (!node.parentId) return null;
+          const parent = working.find((n) => n.id === node.parentId);
+          return parent && parent.type === "subnet" ? (parent.data as SubnetData).cidr : null;
+        };
+
+        const ensureSubnet = (cidr: string) => {
+          let subnet = findSubnetByCidr(cidr);
+          if (!subnet) {
+            const subnetCount = working.filter((n) => n.type === "subnet").length;
+            subnet = {
+              id: uuid(),
+              type: "subnet",
+              position: { x: 650 + subnetCount * 40, y: 60 + subnetCount * 260 },
+              style: { width: 500, height: 190 },
+              zIndex: -1000,
+              data: { kind: "subnet", label: cidr, notes: "", compromised: false, cidr },
+            };
+            working = [...working, subnet];
+            return { subnet, created: true };
+          }
+          return { subnet, created: false };
+        };
+
+        working
+          .filter((n) => isHostData(n.data))
+          .forEach((host) => {
+            const ips = (host.data as { ips: string[] }).ips.filter((ip) => ip.trim());
+            const distinctCidrs = Array.from(
+              new Set(ips.map(networkOf).filter((c): c is string => Boolean(c)))
+            );
+            const liveHost = working.find((n) => n.id === host.id)!;
+
+            // --- No IP, or every IP in the same network: single-parent containment ---
+            if (distinctCidrs.length <= 1) {
+              const desiredCidr = distinctCidrs[0] ?? null;
+              const existingCidr = parentCidrOf(liveHost);
+              if (desiredCidr === existingCidr) return; // already correctly grouped (or ungrouped)
+
+              changed = true;
+
+              if (!desiredCidr) {
+                // No valid IP anymore — leave it wherever it visually is, just detach it.
+                const absPos = liveHost.parentId
+                  ? (() => {
+                      const p = working.find((n) => n.id === liveHost.parentId);
+                      return p
+                        ? { x: p.position.x + liveHost.position.x, y: p.position.y + liveHost.position.y }
+                        : liveHost.position;
+                    })()
+                  : liveHost.position;
+                working = working.map((n) =>
+                  n.id === liveHost.id ? { ...n, parentId: undefined, extent: undefined, position: absPos } : n
+                );
+                return;
+              }
+
+              const { subnet } = ensureSubnet(desiredCidr);
+              const subnetId = subnet.id;
+
+              const siblingCount = working.filter((n) => n.parentId === subnetId).length;
+              const col = siblingCount % SUBNET_COLS;
+              const row = Math.floor(siblingCount / SUBNET_COLS);
+
+              working = working.map((n) =>
+                n.id === liveHost.id
+                  ? {
+                      ...n,
+                      parentId: subnetId,
+                      extent: "parent" as const,
+                      position: { x: 30 + col * SUBNET_COL_WIDTH, y: 60 + row * SUBNET_ROW_HEIGHT },
+                    }
+                  : n
+              );
+
+              const requiredHeight = 90 + Math.ceil((siblingCount + 1) / SUBNET_COLS) * SUBNET_ROW_HEIGHT;
+              working = working.map((n) => {
+                if (n.id !== subnetId) return n;
+                const currentStyle = (n.style ?? {}) as { width?: number; height?: number };
+                return {
+                  ...n,
+                  style: {
+                    width: Math.max(currentStyle.width ?? 0, 500),
+                    height: Math.max(currentStyle.height ?? 0, requiredHeight),
+                  },
+                };
+              });
+              return;
+            }
+
+            // --- IPs span multiple networks: this host is a pivot/bridge, not a
+            // resident of any single subnet. Make sure every network it touches
+            // has a subnet box, and float it outside all of them (reposition only
+            // the first time it becomes a bridge, or when a newly-added IP opens
+            // up a network that doesn't have a box yet — not on every unrelated
+            // edit, so manual dragging afterwards sticks).
+            const wasContained = Boolean(liveHost.parentId);
+            let createdAny = false;
+            const involvedSubnets = distinctCidrs.map((cidr) => {
+              const { subnet, created } = ensureSubnet(cidr);
+              if (created) createdAny = true;
+              return subnet;
+            });
+
+            if (!wasContained && !createdAny) return; // already bridging correctly, leave it alone
+
+            changed = true;
+            const hostWidth = 190;
+            const hostHeight = 80;
+            const cx =
+              involvedSubnets.reduce((sum, s) => {
+                const w = (s.style as { width?: number } | undefined)?.width ?? 500;
+                return sum + s.position.x + w / 2;
+              }, 0) / involvedSubnets.length;
+            const cy =
+              involvedSubnets.reduce((sum, s) => {
+                const h = (s.style as { height?: number } | undefined)?.height ?? 190;
+                return sum + s.position.y + h / 2;
+              }, 0) / involvedSubnets.length;
+
+            working = working.map((n) =>
+              n.id === liveHost.id
+                ? {
+                    ...n,
+                    parentId: undefined,
+                    extent: undefined,
+                    position: { x: cx - hostWidth / 2, y: cy - hostHeight / 2 },
+                  }
+                : n
+            );
+          });
+
+        if (changed) set({ nodes: working });
       },
 
       deleteNode: (id) => {

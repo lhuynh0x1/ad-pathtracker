@@ -1,16 +1,14 @@
 import { useState } from "react";
-import {
-  BaseEdge,
-  EdgeLabelRenderer,
-  getBezierPath,
-  useInternalNode,
-  type EdgeProps,
-} from "@xyflow/react";
+import { BaseEdge, EdgeLabelRenderer, useInternalNode, type EdgeProps } from "@xyflow/react";
 import { X } from "lucide-react";
 import { useGraphStore } from "../../store/useGraphStore";
 import { getFloatingEdgeParams } from "./floating";
 
-const LABEL_OFFSET = 16;
+function hashStr(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+}
 
 export function LabeledEdge({ id, source, target, style, markerEnd, label, selected }: EdgeProps) {
   const [hovered, setHovered] = useState(false);
@@ -22,23 +20,24 @@ export function LabeledEdge({ id, source, target, style, markerEnd, label, selec
 
   if (!sourceNode || !targetNode) return null;
 
-  const { sx, sy, tx, ty, sourcePos, targetPos } = getFloatingEdgeParams(sourceNode, targetNode);
-  const [edgePath, labelX, labelY] = getBezierPath({
-    sourceX: sx,
-    sourceY: sy,
-    sourcePosition: sourcePos,
-    targetX: tx,
-    targetY: ty,
-    targetPosition: targetPos,
-  });
+  const { sx, sy, tx, ty } = getFloatingEdgeParams(sourceNode, targetNode);
 
-  // Nudge the label off to one side of the line (perpendicular to the
-  // source->target direction) so it never sits on top of the stroke/arrowhead.
+  // Bow the curve away from the straight line between the two nodes so it
+  // never visually cuts through a third node that happens to sit between
+  // them, and so edges sharing a pair of nodes fan out instead of overlapping.
   const dx = tx - sx;
   const dy = ty - sy;
-  const len = Math.hypot(dx, dy) || 1;
-  const offsetX = (-dy / len) * LABEL_OFFSET;
-  const offsetY = (dx / len) * LABEL_OFFSET;
+  const dist = Math.hypot(dx, dy) || 1;
+  const nx = -dy / dist;
+  const ny = dx / dist;
+  const sign = hashStr(id) % 2 === 0 ? 1 : -1;
+  const bow = Math.min(70, Math.max(18, dist * 0.18)) * sign;
+  const mx = (sx + tx) / 2 + nx * bow;
+  const my = (sy + ty) / 2 + ny * bow;
+  const edgePath = `M ${sx},${sy} Q ${mx},${my} ${tx},${ty}`;
+  // Point on the quadratic curve at t=0.5.
+  const labelX = 0.25 * sx + 0.5 * mx + 0.25 * tx;
+  const labelY = 0.25 * sy + 0.5 * my + 0.25 * ty;
 
   const active = hovered || selected;
 
@@ -62,7 +61,7 @@ export function LabeledEdge({ id, source, target, style, markerEnd, label, selec
           onMouseLeave={() => setHovered(false)}
           style={{
             position: "absolute",
-            transform: `translate(-50%, -50%) translate(${labelX + offsetX}px, ${labelY + offsetY}px)`,
+            transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
             pointerEvents: active ? "all" : "none",
             zIndex: 10000,
           }}

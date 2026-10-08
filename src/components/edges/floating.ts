@@ -1,4 +1,4 @@
-import { Position, type InternalNode } from "@xyflow/react";
+import type { InternalNode } from "@xyflow/react";
 
 // Finds the point where the straight line between two node centers crosses
 // `intersectionNode`'s rectangle border — this is what makes a "floating"
@@ -27,22 +27,6 @@ function getNodeIntersection(intersectionNode: InternalNode, targetNode: Interna
   return { x: w * (xx3 + yy3) + x2, y: h * (-xx3 + yy3) + y2 };
 }
 
-function getEdgePosition(node: InternalNode, intersectionPoint: { x: number; y: number }) {
-  const n = node.internals.positionAbsolute;
-  const nx = Math.round(n.x);
-  const ny = Math.round(n.y);
-  const px = Math.round(intersectionPoint.x);
-  const py = Math.round(intersectionPoint.y);
-  const width = node.measured.width ?? 170;
-  const height = node.measured.height ?? 60;
-
-  if (px <= nx + 1) return Position.Left;
-  if (px >= nx + width - 1) return Position.Right;
-  if (py <= ny + 1) return Position.Top;
-  if (py >= ny + height - 1) return Position.Bottom;
-  return Position.Top;
-}
-
 export function getFloatingEdgeParams(source: InternalNode, target: InternalNode) {
   const sourceIntersection = getNodeIntersection(source, target);
   const targetIntersection = getNodeIntersection(target, source);
@@ -52,7 +36,5 @@ export function getFloatingEdgeParams(source: InternalNode, target: InternalNode
     sy: sourceIntersection.y,
     tx: targetIntersection.x,
     ty: targetIntersection.y,
-    sourcePos: getEdgePosition(source, sourceIntersection),
-    targetPos: getEdgePosition(target, targetIntersection),
   };
 }

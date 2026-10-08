@@ -17,7 +17,9 @@ export function SubnetNode({ data, selected }: NodeProps<ADNode>) {
       <div className="flex items-center gap-1.5 rounded-br-lg rounded-tl-lg bg-gray-700/80 px-2 py-1 text-xs font-semibold text-gray-100 w-fit">
         <Network size={13} />
         {subnetData.label}
-        {subnetData.cidr && <span className="text-gray-400">({subnetData.cidr})</span>}
+        {subnetData.cidr && subnetData.cidr !== subnetData.label && (
+          <span className="text-gray-400">({subnetData.cidr})</span>
+        )}
       </div>
     </div>
   );
