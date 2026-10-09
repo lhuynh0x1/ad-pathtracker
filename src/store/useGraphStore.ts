@@ -51,9 +51,27 @@ function networkOf(ip: string): string | null {
   return `${octets[0]}.${octets[1]}.${octets[2]}.0/24`;
 }
 
-const SUBNET_COLS = 2;
-const SUBNET_COL_WIDTH = 220;
-const SUBNET_ROW_HEIGHT = 100;
+function absolutePositionOf(node: ADNode, allNodes: ADNode[]): { x: number; y: number } {
+  if (!node.parentId) return node.position;
+  const parent = allNodes.find((n) => n.id === node.parentId);
+  if (!parent) return node.position;
+  const parentAbs = absolutePositionOf(parent, allNodes);
+  return { x: parentAbs.x + node.position.x, y: parentAbs.y + node.position.y };
+}
+
+// Layout constants for auto-sizing containers (hosts holding discovered
+// users, subnets holding hosts) so nothing needs manual resizing.
+const HOST_HEADER_HEIGHT = 110; // room for label/ip/badge rows before the user list starts
+const HOST_ROW_HEIGHT = 86; // height reserved per attached user node
+const HOST_CONTAINER_WIDTH = 260;
+const HOST_BOTTOM_PAD = 16;
+const HOST_DEFAULT_HEIGHT = 80; // fallback used when stacking a childless host in a subnet
+
+const SUBNET_WIDTH = 340;
+const SUBNET_EMPTY_HEIGHT = 160;
+const SUBNET_PAD_TOP = 60; // below the corner label
+const SUBNET_PAD_X = 30;
+const SUBNET_GAP = 20;
 
 interface GraphState {
   nodes: ADNode[];
@@ -76,7 +94,9 @@ interface GraphState {
   selectEdge: (id: string | null) => void;
 
   syncUsersFromHost: (hostId: string) => { created: number; updated: number };
+  syncHostContainerSizing: () => void;
   syncSubnetGrouping: () => void;
+  recomputeLayout: () => void;
 
   addChatMessage: (message: Omit<ChatMessage, "id" | "timestamp">) => void;
   clearChat: () => void;
@@ -127,7 +147,7 @@ export const useGraphStore = create<GraphState>()(
           position,
           data,
           ...(isSubnet
-            ? { style: { width: 480, height: 320 }, zIndex: -1000 }
+            ? { style: { width: SUBNET_WIDTH, height: SUBNET_EMPTY_HEIGHT }, zIndex: -1000 }
             : {}),
         };
         set({ nodes: [...get().nodes, node] });
@@ -139,7 +159,55 @@ export const useGraphStore = create<GraphState>()(
             n.id === id ? { ...n, data: { ...n.data, ...data } as ADNodeData } : n
           ),
         });
-        if ("ips" in data) get().syncSubnetGrouping();
+        if ("ips" in data) get().recomputeLayout();
+      },
+
+      recomputeLayout: () => {
+        get().syncHostContainerSizing();
+        get().syncSubnetGrouping();
+      },
+
+      // Auto-size each host card to fit however many user nodes are nested
+      // inside it (discovered-on-this-host users), stacking them in a
+      // single column and shrinking back to a compact card when empty.
+      syncHostContainerSizing: () => {
+        let working = [...get().nodes];
+        let changed = false;
+
+        working
+          .filter((n) => isHostData(n.data))
+          .forEach((host) => {
+            const liveHost = working.find((n) => n.id === host.id)!;
+            const children = working.filter((n) => n.parentId === host.id && n.data.kind === "user");
+
+            if (children.length === 0) {
+              if (liveHost.style) {
+                changed = true;
+                working = working.map((n) => (n.id === host.id ? { ...n, style: undefined } : n));
+              }
+              return;
+            }
+
+            const height = HOST_HEADER_HEIGHT + children.length * HOST_ROW_HEIGHT + HOST_BOTTOM_PAD;
+            const currentStyle = (liveHost.style ?? {}) as { width?: number; height?: number };
+            if (currentStyle.width !== HOST_CONTAINER_WIDTH || currentStyle.height !== height) {
+              changed = true;
+              working = working.map((n) =>
+                n.id === host.id ? { ...n, style: { width: HOST_CONTAINER_WIDTH, height } } : n
+              );
+            }
+
+            children.forEach((child, idx) => {
+              const desired = { x: 20, y: HOST_HEADER_HEIGHT + idx * HOST_ROW_HEIGHT };
+              const liveChild = working.find((n) => n.id === child.id)!;
+              if (liveChild.position.x !== desired.x || liveChild.position.y !== desired.y) {
+                changed = true;
+                working = working.map((n) => (n.id === child.id ? { ...n, position: desired } : n));
+              }
+            });
+          });
+
+        if (changed) set({ nodes: working });
       },
 
       syncSubnetGrouping: () => {
@@ -162,8 +230,8 @@ export const useGraphStore = create<GraphState>()(
             subnet = {
               id: uuid(),
               type: "subnet",
-              position: { x: 650 + subnetCount * 40, y: 60 + subnetCount * 260 },
-              style: { width: 500, height: 190 },
+              position: { x: 650 + subnetCount * 40, y: 60 + subnetCount * 320 },
+              style: { width: SUBNET_WIDTH, height: SUBNET_EMPTY_HEIGHT },
               zIndex: -1000,
               data: { kind: "subnet", label: cidr, notes: "", compromised: false, cidr },
             };
@@ -192,14 +260,7 @@ export const useGraphStore = create<GraphState>()(
 
               if (!desiredCidr) {
                 // No valid IP anymore — leave it wherever it visually is, just detach it.
-                const absPos = liveHost.parentId
-                  ? (() => {
-                      const p = working.find((n) => n.id === liveHost.parentId);
-                      return p
-                        ? { x: p.position.x + liveHost.position.x, y: p.position.y + liveHost.position.y }
-                        : liveHost.position;
-                    })()
-                  : liveHost.position;
+                const absPos = absolutePositionOf(liveHost, working);
                 working = working.map((n) =>
                   n.id === liveHost.id ? { ...n, parentId: undefined, extent: undefined, position: absPos } : n
                 );
@@ -207,35 +268,16 @@ export const useGraphStore = create<GraphState>()(
               }
 
               const { subnet } = ensureSubnet(desiredCidr);
-              const subnetId = subnet.id;
-
-              const siblingCount = working.filter((n) => n.parentId === subnetId).length;
-              const col = siblingCount % SUBNET_COLS;
-              const row = Math.floor(siblingCount / SUBNET_COLS);
-
               working = working.map((n) =>
                 n.id === liveHost.id
                   ? {
                       ...n,
-                      parentId: subnetId,
+                      parentId: subnet.id,
                       extent: "parent" as const,
-                      position: { x: 30 + col * SUBNET_COL_WIDTH, y: 60 + row * SUBNET_ROW_HEIGHT },
+                      position: { x: SUBNET_PAD_X, y: SUBNET_PAD_TOP },
                     }
                   : n
               );
-
-              const requiredHeight = 90 + Math.ceil((siblingCount + 1) / SUBNET_COLS) * SUBNET_ROW_HEIGHT;
-              working = working.map((n) => {
-                if (n.id !== subnetId) return n;
-                const currentStyle = (n.style ?? {}) as { width?: number; height?: number };
-                return {
-                  ...n,
-                  style: {
-                    width: Math.max(currentStyle.width ?? 0, 500),
-                    height: Math.max(currentStyle.height ?? 0, requiredHeight),
-                  },
-                };
-              });
               return;
             }
 
@@ -260,12 +302,12 @@ export const useGraphStore = create<GraphState>()(
             const hostHeight = 80;
             const cx =
               involvedSubnets.reduce((sum, s) => {
-                const w = (s.style as { width?: number } | undefined)?.width ?? 500;
+                const w = (s.style as { width?: number } | undefined)?.width ?? SUBNET_WIDTH;
                 return sum + s.position.x + w / 2;
               }, 0) / involvedSubnets.length;
             const cy =
               involvedSubnets.reduce((sum, s) => {
-                const h = (s.style as { height?: number } | undefined)?.height ?? 190;
+                const h = (s.style as { height?: number } | undefined)?.height ?? SUBNET_EMPTY_HEIGHT;
                 return sum + s.position.y + h / 2;
               }, 0) / involvedSubnets.length;
 
@@ -281,15 +323,66 @@ export const useGraphStore = create<GraphState>()(
             );
           });
 
+        // Final pass: stack every subnet's contained hosts vertically using
+        // each host's *actual current* height (so a host that's grown tall
+        // from attached users doesn't overlap its neighbors), and size the
+        // subnet to fit exactly — shrinking as well as growing.
+        working
+          .filter((n) => n.type === "subnet")
+          .forEach((subnet) => {
+            const children = working.filter((n) => n.parentId === subnet.id);
+            let y = SUBNET_PAD_TOP;
+            children.forEach((child) => {
+              const pos = { x: SUBNET_PAD_X, y };
+              const live = working.find((n) => n.id === child.id)!;
+              if (live.position.x !== pos.x || live.position.y !== pos.y) {
+                changed = true;
+                working = working.map((n) => (n.id === child.id ? { ...n, position: pos } : n));
+              }
+              const h = (live.style as { height?: number } | undefined)?.height ?? HOST_DEFAULT_HEIGHT;
+              y += h + SUBNET_GAP;
+            });
+
+            const requiredHeight = children.length === 0 ? SUBNET_EMPTY_HEIGHT : y + 10;
+            const liveSubnet = working.find((n) => n.id === subnet.id)!;
+            const currentStyle = (liveSubnet.style ?? {}) as { width?: number; height?: number };
+            if (currentStyle.width !== SUBNET_WIDTH || currentStyle.height !== requiredHeight) {
+              changed = true;
+              working = working.map((n) =>
+                n.id === subnet.id ? { ...n, style: { width: SUBNET_WIDTH, height: requiredHeight } } : n
+              );
+            }
+          });
+
         if (changed) set({ nodes: working });
       },
 
       deleteNode: (id) => {
+        const nodes = get().nodes;
+        const deletedNode = nodes.find((n) => n.id === id);
+        let nextNodes = nodes.filter((n) => n.id !== id);
+
+        if (deletedNode) {
+          const deletedAbsPos = absolutePositionOf(deletedNode, nodes);
+          nextNodes = nextNodes.map((n) =>
+            n.parentId === id
+              ? {
+                  ...n,
+                  parentId: undefined,
+                  extent: undefined,
+                  position: { x: deletedAbsPos.x + n.position.x, y: deletedAbsPos.y + n.position.y },
+                }
+              : n
+          );
+        }
+
         set({
-          nodes: get().nodes.filter((n) => n.id !== id),
+          nodes: nextNodes,
           edges: get().edges.filter((e) => e.source !== id && e.target !== id),
           selectedNodeId: get().selectedNodeId === id ? null : get().selectedNodeId,
         });
+
+        get().recomputeLayout();
       },
 
       selectNode: (id) => set({ selectedNodeId: id, selectedEdgeId: null }),
@@ -336,7 +429,7 @@ export const useGraphStore = create<GraphState>()(
         const domainGuess =
           "domain" in host.data ? (host.data.domain as string) : host.data.hostname || "";
 
-        lines.forEach((line, idx) => {
+        lines.forEach((line) => {
           const [rawUser, secret] = line.split(":").map((s) => s?.trim());
           if (!rawUser) return;
 
@@ -359,20 +452,22 @@ export const useGraphStore = create<GraphState>()(
             };
             updated++;
 
-            const edgeExists = nextEdges.some(
-              (e) => e.source === hostId && e.target === existing.id
-            );
-            if (!edgeExists) {
-              nextEdges.push(makeDiscoveredEdge(hostId, existing.id));
+            // Already nested in (or standalone/elsewhere from) a different
+            // context — don't relocate it, just note it was also seen here.
+            if (existing.parentId !== hostId) {
+              const edgeExists = nextEdges.some((e) => e.source === hostId && e.target === existing.id);
+              if (!edgeExists) nextEdges.push(makeDiscoveredEdge(hostId, existing.id));
             }
           } else {
+            // Brand new — nest it directly inside the host card instead of
+            // floating it off to the side with an arrow. syncHostContainerSizing
+            // (called below) fixes up its exact position/size immediately after.
             const newUser: ADNode = {
               id: uuid(),
               type: "user",
-              position: {
-                x: host.position.x + 260,
-                y: host.position.y + idx * 90,
-              },
+              parentId: hostId,
+              extent: "parent",
+              position: { x: 20, y: 0 },
               data: {
                 kind: "user",
                 label: rawUser,
@@ -386,12 +481,12 @@ export const useGraphStore = create<GraphState>()(
               },
             };
             nextNodes.push(newUser);
-            nextEdges.push(makeDiscoveredEdge(hostId, newUser.id));
             created++;
           }
         });
 
         set({ nodes: nextNodes, edges: nextEdges });
+        get().recomputeLayout();
         return { created, updated };
       },
 

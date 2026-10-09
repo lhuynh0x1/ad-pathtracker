@@ -1,7 +1,7 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { Cable, ShieldAlert, Waypoints } from "lucide-react";
 import { KIND_COLOR, KIND_ICON } from "./icons";
-import type { ADNode } from "../../store/useGraphStore";
+import { useGraphStore, type ADNode } from "../../store/useGraphStore";
 import { isHostData, type AccessLevel } from "../../types/entities";
 
 const ACCESS_BADGE: Record<AccessLevel, { label: string; color: string } | null> = {
@@ -12,7 +12,7 @@ const ACCESS_BADGE: Record<AccessLevel, { label: string; color: string } | null>
   system: { label: "SYSTEM", color: "#ef4444" },
 };
 
-export function ADEntityNode({ data, selected }: NodeProps<ADNode>) {
+export function ADEntityNode({ id, data, selected }: NodeProps<ADNode>) {
   const Icon = KIND_ICON[data.kind];
   const color = KIND_COLOR[data.kind];
   const access = "access" in data ? (data.access as AccessLevel) : undefined;
@@ -24,9 +24,16 @@ export function ADEntityNode({ data, selected }: NodeProps<ADNode>) {
   const multiHomed = ips.length > 1;
   const needsPivot = (host?.services ?? []).some((s) => s.internalOnly);
 
+  // Hosts that have discovered users nested inside them render as a sized
+  // container (fixed by the store's auto-layout) instead of hugging content.
+  const childCount = useGraphStore((s) => s.nodes.filter((n) => n.parentId === id).length);
+  const isContainer = host !== null && childCount > 0;
+
   return (
     <div
-      className="rounded-lg border-2 px-3 py-2 min-w-[150px] shadow-lg backdrop-blur-sm"
+      className={`rounded-lg border-2 px-3 py-2 shadow-lg backdrop-blur-sm ${
+        isContainer ? "h-full w-full" : "min-w-[150px]"
+      }`}
       style={{
         borderColor: data.compromised ? "#ef4444" : selected ? "#ffffff" : color,
         backgroundColor: "rgba(17, 20, 28, 0.92)",
@@ -85,6 +92,12 @@ export function ADEntityNode({ data, selected }: NodeProps<ADNode>) {
           style={{ backgroundColor: badge.color, color: "#0b0e14" }}
         >
           {badge.label}
+        </div>
+      )}
+
+      {isContainer && (
+        <div className="mt-1.5 border-t border-gray-700 pt-1 text-[10px] text-gray-500">
+          {childCount} user{childCount !== 1 ? "s" : ""} discovered here ↓
         </div>
       )}
     </div>

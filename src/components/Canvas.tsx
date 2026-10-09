@@ -44,12 +44,22 @@ export function Canvas() {
     []
   ) as NodeTypes;
 
-  // Subnet containers must render (and sit in the DOM) before the entity
-  // nodes placed visually inside them so they stay behind as a backdrop.
+  // React Flow requires a parent node to appear before its children in the
+  // array — and containment now nests two levels deep (subnet > host >
+  // user), so sort topologically rather than assuming a fixed node-type order.
   const orderedNodes = useMemo(() => {
-    const subnets = nodes.filter((n) => n.type === "subnet");
-    const rest = nodes.filter((n) => n.type !== "subnet");
-    return [...subnets, ...rest];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const placed = new Set<string>();
+    const result: typeof nodes = [];
+    const visit = (n: (typeof nodes)[number]) => {
+      if (placed.has(n.id)) return;
+      const parent = n.parentId ? byId.get(n.parentId) : undefined;
+      if (parent) visit(parent);
+      placed.add(n.id);
+      result.push(n);
+    };
+    nodes.forEach(visit);
+    return result;
   }, [nodes]);
 
   return (
