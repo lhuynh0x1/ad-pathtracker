@@ -6,7 +6,9 @@ import {
   Controls,
   MiniMap,
   ReactFlow,
+  useReactFlow,
   type EdgeTypes,
+  type Node,
   type NodeTypes,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -14,6 +16,7 @@ import { useGraphStore } from "../store/useGraphStore";
 import { ADEntityNode } from "./nodes/ADEntityNode";
 import { SubnetNode } from "./nodes/SubnetNode";
 import { LabeledEdge } from "./edges/LabeledEdge";
+import { FloatingConnectionLine } from "./edges/FloatingConnectionLine";
 import type { ADNodeKind } from "../types/entities";
 
 const ENTITY_KINDS: ADNodeKind[] = [
@@ -35,6 +38,29 @@ export function Canvas() {
   const onConnect = useGraphStore((s) => s.onConnect);
   const selectNode = useGraphStore((s) => s.selectNode);
   const selectEdge = useGraphStore((s) => s.selectEdge);
+  const attachUserToHost = useGraphStore((s) => s.attachUserToHost);
+  const detachUserFromHost = useGraphStore((s) => s.detachUserFromHost);
+  const { getIntersectingNodes, getInternalNode } = useReactFlow();
+
+  const handleNodeDragStop = (_: unknown, node: Node) => {
+    if (node.data.kind !== "user") return;
+    // `node.position` here is relative to its parent (if any), but we need
+    // an absolute rect to test against other nodes — read it from the
+    // internal node state instead of the (possibly parent-relative) event payload.
+    const internal = getInternalNode(node.id);
+    if (!internal) return;
+    const { x, y } = internal.internals.positionAbsolute;
+    const rect = { x, y, width: internal.measured.width ?? 170, height: internal.measured.height ?? 60 };
+
+    const host = getIntersectingNodes(rect).find(
+      (n) => n.type === "computer" || n.type === "domain-controller"
+    );
+    if (host) {
+      attachUserToHost(node.id, host.id);
+    } else if (node.parentId) {
+      detachUserFromHost(node.id);
+    }
+  };
 
   const nodeTypes = useMemo<NodeTypes>(
     () => ({
@@ -71,9 +97,11 @@ export function Canvas() {
       onConnect={onConnect}
       nodeTypes={nodeTypes}
       edgeTypes={edgeTypes}
+      connectionLineComponent={FloatingConnectionLine}
       connectionMode={ConnectionMode.Loose}
       deleteKeyCode={["Backspace", "Delete"]}
       onNodeClick={(_, node) => selectNode(node.id)}
+      onNodeDragStop={handleNodeDragStop}
       onEdgeClick={(_, edge) => selectEdge(edge.id)}
       onPaneClick={() => {
         selectNode(null);

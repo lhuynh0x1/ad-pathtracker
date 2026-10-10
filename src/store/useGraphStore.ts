@@ -71,7 +71,9 @@ const SUBNET_WIDTH = 340;
 const SUBNET_EMPTY_HEIGHT = 160;
 const SUBNET_PAD_TOP = 60; // below the corner label
 const SUBNET_PAD_X = 30;
-const SUBNET_GAP = 20;
+const SUBNET_GAP = 20; // between stacked hosts inside a subnet, and between stacked subnets
+const SUBNET_X = 650; // all subnets stack in a single column at this x
+const BRIDGE_GAP = 80; // clearance to the right of the subnet column for pivot/bridge hosts
 
 interface GraphState {
   nodes: ADNode[];
@@ -88,6 +90,8 @@ interface GraphState {
   updateNodeData: (id: string, data: Partial<ADNodeData>) => void;
   deleteNode: (id: string) => void;
   selectNode: (id: string | null) => void;
+  attachUserToHost: (userId: string, hostId: string) => void;
+  detachUserFromHost: (userId: string) => void;
 
   updateEdgeData: (id: string, data: Partial<ADEdgeData>) => void;
   deleteEdge: (id: string) => void;
@@ -224,22 +228,25 @@ export const useGraphStore = create<GraphState>()(
         };
 
         const ensureSubnet = (cidr: string) => {
-          let subnet = findSubnetByCidr(cidr);
-          if (!subnet) {
-            const subnetCount = working.filter((n) => n.type === "subnet").length;
-            subnet = {
-              id: uuid(),
-              type: "subnet",
-              position: { x: 650 + subnetCount * 40, y: 60 + subnetCount * 320 },
-              style: { width: SUBNET_WIDTH, height: SUBNET_EMPTY_HEIGHT },
-              zIndex: -1000,
-              data: { kind: "subnet", label: cidr, notes: "", compromised: false, cidr },
-            };
-            working = [...working, subnet];
-            return { subnet, created: true };
-          }
-          return { subnet, created: false };
+          const existing = findSubnetByCidr(cidr);
+          if (existing) return existing;
+          const subnet: ADNode = {
+            id: uuid(),
+            type: "subnet",
+            position: { x: SUBNET_X, y: 0 }, // y finalized in the stacking pass below
+            style: { width: SUBNET_WIDTH, height: SUBNET_EMPTY_HEIGHT },
+            zIndex: -1000,
+            data: { kind: "subnet", label: cidr, notes: "", compromised: false, cidr },
+          };
+          working = [...working, subnet];
+          changed = true;
+          return subnet;
         };
+
+        // --- Phase 1: decide membership — which single subnet a host belongs
+        // to, or which subnets a multi-homed host bridges (without finalizing
+        // bridge position yet, since that depends on the final subnet stack).
+        const bridgeHostIds: { hostId: string; cidrs: string[] }[] = [];
 
         working
           .filter((n) => isHostData(n.data))
@@ -267,7 +274,7 @@ export const useGraphStore = create<GraphState>()(
                 return;
               }
 
-              const { subnet } = ensureSubnet(desiredCidr);
+              const subnet = ensureSubnet(desiredCidr);
               working = working.map((n) =>
                 n.id === liveHost.id
                   ? {
@@ -281,56 +288,35 @@ export const useGraphStore = create<GraphState>()(
               return;
             }
 
-            // --- IPs span multiple networks: this host is a pivot/bridge, not a
-            // resident of any single subnet. Make sure every network it touches
-            // has a subnet box, and float it outside all of them (reposition only
-            // the first time it becomes a bridge, or when a newly-added IP opens
-            // up a network that doesn't have a box yet — not on every unrelated
-            // edit, so manual dragging afterwards sticks).
-            const wasContained = Boolean(liveHost.parentId);
-            let createdAny = false;
-            const involvedSubnets = distinctCidrs.map((cidr) => {
-              const { subnet, created } = ensureSubnet(cidr);
-              if (created) createdAny = true;
-              return subnet;
-            });
-
-            if (!wasContained && !createdAny) return; // already bridging correctly, leave it alone
-
-            changed = true;
-            const hostWidth = 190;
-            const hostHeight = 80;
-            const cx =
-              involvedSubnets.reduce((sum, s) => {
-                const w = (s.style as { width?: number } | undefined)?.width ?? SUBNET_WIDTH;
-                return sum + s.position.x + w / 2;
-              }, 0) / involvedSubnets.length;
-            const cy =
-              involvedSubnets.reduce((sum, s) => {
-                const h = (s.style as { height?: number } | undefined)?.height ?? SUBNET_EMPTY_HEIGHT;
-                return sum + s.position.y + h / 2;
-              }, 0) / involvedSubnets.length;
-
-            working = working.map((n) =>
-              n.id === liveHost.id
-                ? {
-                    ...n,
-                    parentId: undefined,
-                    extent: undefined,
-                    position: { x: cx - hostWidth / 2, y: cy - hostHeight / 2 },
-                  }
-                : n
-            );
+            // --- IPs span multiple networks: this host is a pivot/bridge, not
+            // a resident of any single subnet (dropping it inside one would
+            // misrepresent it, and its box could later grow and spill out of
+            // that subnet's boundary). Make sure every network it touches has
+            // a subnet box, and remember it for bridge positioning in Phase 3.
+            distinctCidrs.forEach(ensureSubnet);
+            if (liveHost.parentId) {
+              changed = true;
+              const absPos = absolutePositionOf(liveHost, working);
+              working = working.map((n) =>
+                n.id === liveHost.id ? { ...n, parentId: undefined, extent: undefined, position: absPos } : n
+              );
+            }
+            bridgeHostIds.push({ hostId: host.id, cidrs: distinctCidrs });
           });
 
-        // Final pass: stack every subnet's contained hosts vertically using
-        // each host's *actual current* height (so a host that's grown tall
-        // from attached users doesn't overlap its neighbors), and size the
-        // subnet to fit exactly — shrinking as well as growing.
+        // --- Phase 2: stack every subnet vertically in a single column,
+        // using each one's *actual current* content height (so a host that's
+        // grown tall from attached users doesn't overlap its neighbors), and
+        // size each subnet to fit exactly — shrinking as well as growing.
+        // Subnets are repositioned based on the *previous* subnet's real
+        // bottom edge (not a fixed offset), so subnets never overlap each
+        // other either, however tall their contents get.
+        let cursorY = 60;
         working
           .filter((n) => n.type === "subnet")
-          .forEach((subnet) => {
-            const children = working.filter((n) => n.parentId === subnet.id);
+          .map((n) => n.id)
+          .forEach((subnetId) => {
+            const children = working.filter((n) => n.parentId === subnetId);
             let y = SUBNET_PAD_TOP;
             children.forEach((child) => {
               const pos = { x: SUBNET_PAD_X, y };
@@ -344,15 +330,55 @@ export const useGraphStore = create<GraphState>()(
             });
 
             const requiredHeight = children.length === 0 ? SUBNET_EMPTY_HEIGHT : y + 10;
-            const liveSubnet = working.find((n) => n.id === subnet.id)!;
+            const liveSubnet = working.find((n) => n.id === subnetId)!;
             const currentStyle = (liveSubnet.style ?? {}) as { width?: number; height?: number };
-            if (currentStyle.width !== SUBNET_WIDTH || currentStyle.height !== requiredHeight) {
+            const desiredPos = { x: SUBNET_X, y: cursorY };
+            if (
+              currentStyle.width !== SUBNET_WIDTH ||
+              currentStyle.height !== requiredHeight ||
+              liveSubnet.position.x !== desiredPos.x ||
+              liveSubnet.position.y !== desiredPos.y
+            ) {
               changed = true;
               working = working.map((n) =>
-                n.id === subnet.id ? { ...n, style: { width: SUBNET_WIDTH, height: requiredHeight } } : n
+                n.id === subnetId
+                  ? { ...n, position: desiredPos, style: { width: SUBNET_WIDTH, height: requiredHeight } }
+                  : n
               );
             }
+            cursorY += requiredHeight + SUBNET_GAP;
           });
+
+        // --- Phase 3: position every bridge host clear of the *entire*
+        // subnet column (to its right), vertically centered between the
+        // subnets it bridges — this can never overlap a subnet box
+        // regardless of how tall anything grows, unlike squeezing it into a
+        // gap between two subnets whose heights change independently.
+        const rightEdge =
+          working
+            .filter((n) => n.type === "subnet")
+            .reduce(
+              (max, s) => Math.max(max, s.position.x + ((s.style as { width?: number })?.width ?? SUBNET_WIDTH)),
+              0
+            ) + BRIDGE_GAP;
+
+        bridgeHostIds.forEach(({ hostId, cidrs }) => {
+          const involved = cidrs.map(findSubnetByCidr).filter((s): s is ADNode => Boolean(s));
+          if (involved.length === 0) return;
+          const avgY =
+            involved.reduce((sum, s) => {
+              const h = (s.style as { height?: number } | undefined)?.height ?? SUBNET_EMPTY_HEIGHT;
+              return sum + s.position.y + h / 2;
+            }, 0) / involved.length;
+
+          const hostHeight = 80;
+          const desired = { x: rightEdge, y: avgY - hostHeight / 2 };
+          const liveHost = working.find((n) => n.id === hostId)!;
+          if (liveHost.position.x !== desired.x || liveHost.position.y !== desired.y) {
+            changed = true;
+            working = working.map((n) => (n.id === hostId ? { ...n, position: desired } : n));
+          }
+        });
 
         if (changed) set({ nodes: working });
       },
@@ -386,6 +412,36 @@ export const useGraphStore = create<GraphState>()(
       },
 
       selectNode: (id) => set({ selectedNodeId: id, selectedEdgeId: null }),
+
+      // Drag-and-drop a User node onto a Computer/DC node to mark "this user
+      // was seen on this device" — called from Canvas's onNodeDragStop once
+      // it detects the drop landed on a host.
+      attachUserToHost: (userId, hostId) => {
+        const nodes = get().nodes;
+        const user = nodes.find((n) => n.id === userId);
+        const host = nodes.find((n) => n.id === hostId);
+        if (!user || user.data.kind !== "user" || !host || !isHostData(host.data)) return;
+        if (user.parentId === hostId) {
+          get().recomputeLayout(); // still snap it back into the clean stack slot
+          return;
+        }
+
+        set({
+          nodes: nodes.map((n) => (n.id === userId ? { ...n, parentId: hostId, position: { x: 20, y: 0 } } : n)),
+        });
+        get().recomputeLayout();
+      },
+
+      detachUserFromHost: (userId) => {
+        const nodes = get().nodes;
+        const user = nodes.find((n) => n.id === userId);
+        if (!user || !user.parentId) return;
+        const absPos = absolutePositionOf(user, nodes);
+        set({
+          nodes: nodes.map((n) => (n.id === userId ? { ...n, parentId: undefined, position: absPos } : n)),
+        });
+        get().recomputeLayout();
+      },
 
       updateEdgeData: (id, data) => {
         set({
@@ -466,7 +522,9 @@ export const useGraphStore = create<GraphState>()(
               id: uuid(),
               type: "user",
               parentId: hostId,
-              extent: "parent",
+              // No `extent: 'parent'` — kept free-draggable so it can be
+              // manually dragged back out; onNodeDragStop decides whether a
+              // drop keeps it attached based on where it actually lands.
               position: { x: 20, y: 0 },
               data: {
                 kind: "user",
@@ -507,14 +565,63 @@ export const useGraphStore = create<GraphState>()(
     }),
     {
       name: "ad-pathtracker-session",
-      version: 2,
-      migrate: (persisted, version) => {
-        if (version < 2) {
-          // Node data shape changed (single `ip` -> `ips[]`, added services/nmap/discoveredUsers).
-          // Old sessions can't be safely upgraded automatically, so start fresh rather than crash.
-          return { nodes: [], edges: [], selectedNodeId: null, selectedEdgeId: null, chatMessages: [] };
-        }
-        return persisted as GraphState;
+      version: 3,
+      // Earlier versions wiped the whole session on any version bump. That's
+      // overkill for the common case (a new optional field added to a node's
+      // data) and does nothing for the case it doesn't catch (a field added
+      // without remembering to bump `version`, which used to crash instead).
+      // `merge` runs on *every* load regardless of version, and repairs each
+      // node/edge by filling in anything missing from its kind's current
+      // defaults — so a saved session survives routine schema growth and a
+      // refresh just works. A field *rename* (not just an addition) would
+      // still need a one-off conversion added here when that happens.
+      migrate: (persisted) => persisted as GraphState,
+      merge: (persistedState, currentState) => {
+        const persisted = (persistedState ?? {}) as Partial<GraphState>;
+
+        const nodes: ADNode[] = Array.isArray(persisted.nodes)
+          ? persisted.nodes
+              .filter(
+                (n): n is ADNode =>
+                  Boolean(n) &&
+                  typeof n === "object" &&
+                  typeof n.id === "string" &&
+                  Boolean(n.data) &&
+                  n.data.kind in NODE_DEFAULTS
+              )
+              .map((n) => ({ ...n, data: { ...NODE_DEFAULTS[n.data.kind](), ...n.data } }))
+          : currentState.nodes;
+
+        const edges: ADEdge[] = Array.isArray(persisted.edges)
+          ? persisted.edges
+              .filter(
+                (e): e is ADEdge =>
+                  Boolean(e) && typeof e === "object" && typeof e.id === "string" && Boolean(e.source) && Boolean(e.target)
+              )
+              .map((e) => ({
+                ...e,
+                type: "adedge",
+                data: e.data && (e.data as ADEdgeData).kind ? e.data : ({ kind: "custom", note: "" } as ADEdgeData),
+              }))
+          : currentState.edges;
+
+        return {
+          ...currentState,
+          nodes,
+          edges,
+          chatMessages: Array.isArray(persisted.chatMessages) ? persisted.chatMessages : currentState.chatMessages,
+        };
+      },
+      onRehydrateStorage: () => () => {
+        // `merge` repairs data shape on load, but the *positions/sizes* baked
+        // into a saved session reflect whatever the layout engine computed
+        // the last time something changed — not necessarily today's layout
+        // rules. Re-running it once after load snaps an older session to the
+        // current rules (e.g. a bridging host that used to overlap a subnet
+        // before that was fixed) without waiting for an unrelated edit to
+        // trigger it. Deferred because the store reference isn't assigned yet
+        // at the point zustand invokes this.
+        queueMicrotask(() => useGraphStore.getState().recomputeLayout());
       },
     }
   )

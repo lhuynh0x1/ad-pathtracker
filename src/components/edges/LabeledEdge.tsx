@@ -2,15 +2,9 @@ import { useState } from "react";
 import { BaseEdge, EdgeLabelRenderer, useInternalNode, type EdgeProps } from "@xyflow/react";
 import { X } from "lucide-react";
 import { useGraphStore } from "../../store/useGraphStore";
-import { getFloatingEdgeParams } from "./floating";
+import { bowedPath, getFloatingEdgeParams } from "./floating";
 
-function hashStr(s: string): number {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return h;
-}
-
-export function LabeledEdge({ id, source, target, style, markerEnd, label, selected }: EdgeProps) {
+export function LabeledEdge({ source, target, style, markerEnd, label, selected, id }: EdgeProps) {
   const [hovered, setHovered] = useState(false);
   const deleteEdge = useGraphStore((s) => s.deleteEdge);
   const selectEdge = useGraphStore((s) => s.selectEdge);
@@ -21,23 +15,10 @@ export function LabeledEdge({ id, source, target, style, markerEnd, label, selec
   if (!sourceNode || !targetNode) return null;
 
   const { sx, sy, tx, ty } = getFloatingEdgeParams(sourceNode, targetNode);
-
-  // Bow the curve away from the straight line between the two nodes so it
-  // never visually cuts through a third node that happens to sit between
-  // them, and so edges sharing a pair of nodes fan out instead of overlapping.
-  const dx = tx - sx;
-  const dy = ty - sy;
-  const dist = Math.hypot(dx, dy) || 1;
-  const nx = -dy / dist;
-  const ny = dx / dist;
-  const sign = hashStr(id) % 2 === 0 ? 1 : -1;
-  const bow = Math.min(70, Math.max(18, dist * 0.18)) * sign;
-  const mx = (sx + tx) / 2 + nx * bow;
-  const my = (sy + ty) / 2 + ny * bow;
-  const edgePath = `M ${sx},${sy} Q ${mx},${my} ${tx},${ty}`;
-  // Point on the quadratic curve at t=0.5.
-  const labelX = 0.25 * sx + 0.5 * mx + 0.25 * tx;
-  const labelY = 0.25 * sy + 0.5 * my + 0.25 * ty;
+  // Seeded by the node-id pair (not the edge's own id) so the live
+  // connection-drag preview — which doesn't have an edge id yet — bows the
+  // same way the final edge will, with no visible "flip" on completion.
+  const { path: edgePath, labelX, labelY } = bowedPath(sx, sy, tx, ty, source + target);
 
   const active = hovered || selected;
 
